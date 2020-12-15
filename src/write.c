@@ -153,7 +153,7 @@ void bruck_reads(int rank, int num_proc, size_t * buffs_by_procs, char** data2)
 	MPI_Comm comm = COMM_WORLD;
 
 	int k, m, srank, rrank;
-	MPI_Datatype dt_send, dt_recv;
+
 	size_t *recv_size_by_proc	= malloc(sizeof(size_t));
 	size_t *send_size_by_proc	= malloc(sizeof(size_t));
 	int *recv_index				= malloc(sizeof(int));
@@ -173,16 +173,14 @@ void bruck_reads(int rank, int num_proc, size_t * buffs_by_procs, char** data2)
 		int count = badCount(k, num_proc);
 		recv_index = realloc(recv_index, sizeof(int) * count);
 
-		count = create_send_datatype_for_reads(rank, num_proc, buffs_by_procs, data2, k, &dt_send, &recv_index);
-		MPI_Type_commit(&dt_send);
-
 		send_size_by_proc = realloc(send_size_by_proc, count*sizeof(size_t));
 		recv_size_by_proc = realloc(recv_size_by_proc, count*sizeof(size_t));
 
-		send_total = get_send_size(rank, num_proc, buffs_by_procs, &send_size_by_proc, count, k);
-		MPI_Pack_size(1, dt_send, comm, &packsize);
 
-		assert(packsize == send_total);
+		size_t packed_size = 0;
+		void * data = create_send_datatype_for_reads(rank, num_proc, buffs_by_procs, data2, k, &packed_size, &recv_index);
+
+		send_total = get_send_size(rank, num_proc, buffs_by_procs, &send_size_by_proc, count, k);
 
 		MPI_Sendrecv(send_size_by_proc, count, MPI_LONG_LONG_INT, srank, 0,
 				recv_size_by_proc, count, MPI_LONG_LONG_INT,
@@ -197,8 +195,10 @@ void bruck_reads(int rank, int num_proc, size_t * buffs_by_procs, char** data2)
 		interbuff = realloc(interbuff, total+1);
 		memset(interbuff,0,(total+1)*sizeof(char));
 
-		MPI_Sendrecv(MPI_BOTTOM, 1, dt_send, srank, 0,
+		MPI_Sendrecv(data, packed_size, MPI_CHAR, srank, 0,
 				interbuff, total, MPI_PACKED, rrank, 0, comm, MPI_STATUS_IGNORE);
+
+		free(data);
 
 		for ( m = 0; m < count; m++){
 			// according to the recieve size
@@ -208,31 +208,31 @@ void bruck_reads(int rank, int num_proc, size_t * buffs_by_procs, char** data2)
 			}
 		}
 
-		MPI_Aint indices[count];
+		void * indices[count];
 		int blocklens[count];
 		MPI_Datatype oldtypes[count];
 
 		for (m = 0; m < count; m++){
 
 			blocklens[m] = (int)recv_size_by_proc[m];
-			MPI_Get_address(data2[recv_index[m]], &indices[m]);
+			indices[m] = data2[recv_index[m]];
 			oldtypes[m] = MPI_CHAR;
 		}
 
-		//Create structure of recieve type
-		MPI_Type_create_struct(count, blocklens, indices, oldtypes, &dt_recv);
-		MPI_Type_commit(&dt_recv);
-
-		int pos=0;
-		MPI_Unpack(interbuff, total, &pos, MPI_BOTTOM, 1, dt_recv, comm);
+		size_t curr_off = 0;
+		int i;
+		for( i = 0; i < count; i++)
+		{
+			memcpy(indices[i], interbuff + curr_off, blocklens[i]);
+			curr_off += blocklens[i];
+		}
 
 		for(m = 0; m<count; m++)
 		{
 			buffs_by_procs[recv_index[m]] = strlen(data2[recv_index[m]])+1;
 		}
+
 		MPI_Barrier(comm);
-		MPI_Type_free(&dt_recv);
-		MPI_Type_free(&dt_send);
 		count = 0;
 	}
 
@@ -298,10 +298,9 @@ void bruck_offsets(int rank, int num_proc, int local_readNum, size_t* number_of_
 		rrank = (rank + k) % num_proc;	//Rank to recv from
 		int count = badCount(k, num_proc);
 		recv_index = malloc(sizeof(int) * count);
-		count = create_send_datatype_for_offsets(rank, num_proc, number_of_reads_by_procs,
-				data_offsets, k, &dt_send, &recv_index);
-
-		MPI_Type_commit(&dt_send);
+	
+		size_t pack_count = 0;
+		void * data = create_send_datatype_for_offsets(rank, num_proc, number_of_reads_by_procs, data_offsets, k, &pack_count, &recv_index);
 
 		send_size_by_proc = malloc(count*sizeof(size_t));
 		recv_size_by_proc = malloc(count*sizeof(size_t));
@@ -309,8 +308,7 @@ void bruck_offsets(int rank, int num_proc, int local_readNum, size_t* number_of_
 		send_total = get_send_size(rank, num_proc, number_of_reads_by_procs,
 				&send_size_by_proc, count, k);
 
-		MPI_Pack_size(1, dt_send, comm, &packsize);
-		assert(packsize == (8 * send_total));
+		assert(pack_count == send_total);
 
 		MPI_Sendrecv(send_size_by_proc, count, MPI_LONG_LONG_INT, srank, 0,
 				recv_size_by_proc, count, MPI_LONG_LONG_INT,
@@ -322,9 +320,12 @@ void bruck_offsets(int rank, int num_proc, int local_readNum, size_t* number_of_
 		{
 			total += recv_size_by_proc[m];
 		}
+	
 		size_t *interbuff_offset = calloc(total, sizeof(size_t));
-		MPI_Sendrecv(MPI_BOTTOM, 1, dt_send, srank, 0,
+	
+		MPI_Sendrecv(data, pack_count, MPI_LONG_LONG_INT, srank, 0,
 				interbuff_offset, total, MPI_LONG_LONG_INT, rrank, 0, comm, &status);
+
 		for ( m = 0; m < count; m++){
 			// we free and allocate data_offsets
 			// according to the recieve size
@@ -350,7 +351,6 @@ void bruck_offsets(int rank, int num_proc, int local_readNum, size_t* number_of_
 				//assert(data_offsets[recv_index[m]][j] != 0);
 			}
 		}
-		MPI_Type_free(&dt_send);
 		count = 0;
 
 		// problem with the interbuff free !!!
@@ -421,18 +421,15 @@ void bruck_size(int rank, int num_proc, size_t local_readNum, size_t* number_of_
 		int count = badCount(k, num_proc);
 		recv_index = malloc(sizeof(int) * count);
 
-		count = create_send_datatype_for_size(rank, num_proc, number_of_reads_by_procs,
-				data_size, k, &dt_send, &recv_index);
-
-		MPI_Type_commit(&dt_send);
+		size_t pack_size = 0;
+		void * data = create_send_datatype_for_size(rank, num_proc, number_of_reads_by_procs,
+				data_size, k, &pack_size, &recv_index);
 
 		send_size_by_proc = malloc(count * sizeof(size_t));
 		recv_size_by_proc = malloc(count * sizeof(size_t));
 
 		send_total = get_send_size(rank, num_proc, number_of_reads_by_procs,
 				&send_size_by_proc, count, k);
-
-		MPI_Pack_size(1, dt_send, comm, &packsize);
 
 		MPI_Sendrecv(send_size_by_proc, count, MPI_LONG_LONG_INT, srank, 0,
 				recv_size_by_proc, count, MPI_LONG_LONG_INT,
@@ -447,8 +444,10 @@ void bruck_size(int rank, int num_proc, size_t local_readNum, size_t* number_of_
 
 		int *interbuff_offset = malloc(total*sizeof(int));
 
-		MPI_Sendrecv(MPI_BOTTOM, 1, dt_send, srank, 0,
+		MPI_Sendrecv(data, pack_size, MPI_INT, srank, 0,
 				interbuff_offset, total, MPI_INT, rrank, 0, comm, MPI_STATUS_IGNORE);
+
+		free(data);
 
 		for ( m = 0; m < count; m++){
 			// we free and allocate data_offsets
@@ -470,8 +469,6 @@ void bruck_size(int rank, int num_proc, size_t local_readNum, size_t* number_of_
 			number_of_reads_by_procs[recv_index[m]] = recv_size_by_proc[m];
 
 		}
-
-		MPI_Type_free(&dt_send);
 
 		count = 0;
 		free(interbuff_offset);
@@ -1317,30 +1314,35 @@ void writeSam(
 				}
 
 				//Variable for datatype struct
-				MPI_Aint *indices 		= malloc(current_pack_readNum * sizeof(MPI_Aint));
+				void **indices 		= malloc(current_pack_readNum * sizeof(MPI_Aint));
 				int *blocklens    		= malloc(current_pack_readNum * sizeof(int));
 				MPI_Datatype *oldtypes 		= malloc(current_pack_readNum * sizeof(MPI_Datatype));
 
-				MPI_Aint adress_to_write_in_data_by_element[num_proc];
+				void * adress_to_write_in_data_by_element[num_proc];
 				for(i = 0; i < num_proc; i++){
-					MPI_Get_address(data3[(rank-i+num_proc)%num_proc], &adress_to_write_in_data_by_element[(rank+i)%num_proc]);
+					adress_to_write_in_data_by_element[(rank+i)%num_proc] = data3[(rank-i+num_proc)%num_proc];
 				}
 
 				for(i = 0; i < current_pack_readNum; i++){
 					indices[i] = adress_to_write_in_data_by_element[new_local_reads_dest_rank_sorted_bruck3[i]];
-					assert (indices[i] != (MPI_Aint)NULL);
+					assert (indices[i] != NULL);
 					adress_to_write_in_data_by_element[new_local_reads_dest_rank_sorted_bruck3[i]] += new_local_reads_sizes_sorted_bruck3[i];
 					blocklens[i] = new_local_reads_sizes_sorted_bruck3[i];
 					oldtypes[i] = MPI_CHAR;
 			 	}
 
+
+				unpack_buffer(NULL, data_pack, current_pack_readNum, indices, blocklens, sizeof(char));
+
 				//Create struct
+#if 0
 				MPI_Type_create_struct(current_pack_readNum, blocklens, indices, oldtypes, &dt_data);
 				MPI_Type_commit(&dt_data);
 				pos=0;
 				res = MPI_Unpack(data_pack, new_data_sz, &pos, MPI_BOTTOM, 1, dt_data, COMM_WORLD);
 				assert(res == MPI_SUCCESS);
 				MPI_Type_free(&dt_data);
+#endif
 
 				free(data_pack);
 				free(blocklens);
