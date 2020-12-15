@@ -29,6 +29,8 @@
 #include <config.h>
 #endif
 
+#include <unistd.h>
+
 #include "parser.h"
 
 char parse_mode;
@@ -55,7 +57,7 @@ size_t hash_name(char * line, int max)
  	return result;
  }
 
-void init_goff(MPI_File mpi_filed,unsigned int headerSize,size_t fsize,int numproc,int rank, size_t *goff){
+void init_goff(int mpi_file_descriptor, unsigned int headerSize,size_t fsize,int numproc,int rank, size_t *goff){
 
 
 	char * current_line = NULL;
@@ -74,8 +76,9 @@ void init_goff(MPI_File mpi_filed,unsigned int headerSize,size_t fsize,int numpr
 	for(i=1;i<numproc;i++)
 	{
 		current_line =(char*)calloc(1000,sizeof(char));
-		MPI_File_read_at(mpi_filed, (MPI_Offset)goff[i], current_line, 1000, MPI_CHAR, &status);
-		assert(strlen(current_line) != 0);
+
+		int ret = pread(mpi_file_descriptor, current_line, 1000, goff[i]);
+		assert(ret > 0);
 		j=0;
 		while(j<fsize && current_line[j] != '\n'){j++;}
 		goff[i]+=(j+1);

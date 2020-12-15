@@ -39,6 +39,8 @@ extern size_t g_wu_master;
 extern MPI_Comm COMM_WORLD;
 extern MPI_Status status;
 
+size_t file_get_size(char * path);
+
 void create_read_dt(int rank, int num_proc, int *ranks, int* buffs, char** data, MPI_Datatype* dt, size_t readNum);
 
 int create_send_datatype_for_size(int rank, int size, size_t *num_reads_by_procs, int **dest_size,

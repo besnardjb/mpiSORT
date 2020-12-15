@@ -119,8 +119,8 @@ int main (int argc, char *argv[]){
 	off_t hsiz;
 	struct stat st;
 
-	MPI_File mpi_filed;
-	MPI_File mpi_file_split_comm;
+	int mpi_file_descriptor;
+	int mpi_file_split_descriptor;
 
 	MPI_Offset fileSize, unmapped_start, discordant_start;
 	int num_proc, rank;
@@ -290,44 +290,16 @@ int main (int argc, char *argv[]){
 	assert(close(fd) != -1);
 
 
-    // BEGIN> FINE TUNING FINFO FOR WRITING OPERATIONS
-
-	MPI_Info_create(&finfo);
-	/*
-	 * In this part you shall adjust the striping factor and unit according
-	 * to the underlying filesystem.
-	 * Harmless for other file system.
-	 *
-	 */
-	MPI_Info_set(finfo,"striping_factor", STRIPING_FACTOR);
-	MPI_Info_set(finfo,"striping_unit", STRIPING_UNIT); //2G striping
-	MPI_Info_set(finfo,"ind_rd_buffer_size", STRIPING_UNIT); //2gb buffer
-	MPI_Info_set(finfo,"romio_ds_read",DATA_SIEVING_READ);
-
-	/*
-	 * for collective reading and writing
-	 * should be adapted too and tested according to the file system
-	 * Harmless for other file system.
-	 */
-	MPI_Info_set(finfo,"nb_proc", NB_PROC);
-	MPI_Info_set(finfo,"cb_nodes", CB_NODES);
-	MPI_Info_set(finfo,"cb_block_size", CB_BLOCK_SIZE);
-	MPI_Info_set(finfo,"cb_buffer_size", CB_BUFFER_SIZE);
-    
-    // END> FINE TUNING FINFO FOR WRITING OPERATIONS
-
-
 	//we open the input file
-	ierr = MPI_File_open(MPI_COMM_WORLD, file_name,  MPI_MODE_RDONLY , finfo, &mpi_filed);
-	//assert(in != -1);
-	if (ierr){
+	mpi_file_descriptor = open(file_name, O_RDONLY );
+
+	if (mpi_file_descriptor == -1){
 		if (rank == 0) fprintf(stderr, "%s: Failed to open file in process 0 %s\n", argv[0], argv[1]);
-		MPI_Abort(MPI_COMM_WORLD, errorcode);
+		perror("open");
 		exit(2);
 	}
-	ierr = MPI_File_get_size(mpi_filed, &fileSize);
-	assert(ierr == MPI_SUCCESS);
-	input_file_size = (long long)fileSize;
+
+	input_file_size = file_get_size(file_name);
 
 	/* Get chunk offset and size */
 	fsiz = input_file_size;
@@ -340,7 +312,7 @@ int main (int argc, char *argv[]){
 
 	//We place file offset of each process to the begining of one read's line
 	size_t *goff =(size_t*)calloc((size_t)(num_proc+1), sizeof(size_t));
-	init_goff(mpi_filed,hsiz,input_file_size,num_proc,rank,goff);
+	init_goff(mpi_file_descriptor,hsiz,input_file_size,num_proc,rank,goff);
 
 	//We calculate the size to read for each process
 	lsiz = goff[rank+1]-goff[rank];
@@ -384,14 +356,20 @@ int main (int argc, char *argv[]){
 
 		// we load the buffer
 		//hold temporary size of SAM
-		//due to limitation in MPI_File_read_at
 		local_data_tmp =(char*)realloc(local_data_tmp, (size_to_read+1)*sizeof(char));
 		local_data_tmp[size_to_read]=0;
 
 		// Original reading part is before 18/09/2015
-		MPI_File_read_at(mpi_filed, (MPI_Offset)poffset, local_data_tmp, size_to_read, MPI_CHAR, MPI_STATUS_IGNORE);
+		int size_read = pread(mpi_file_descriptor, local_data_tmp, size_to_read, poffset);
+		
+		if(size_read < 0)
+		{
+			perror("pread");
+			exit(2);
+		}
+		
 		size_t local_offset=0;
-		assert(strlen(local_data_tmp) == size_to_read);
+		assert(size_read == size_to_read);
 
 		//we look where is the last line read for updating next poffset
 		size_t offset_last_line = size_to_read-1;
@@ -403,7 +381,7 @@ int main (int argc, char *argv[]){
 		}
 
 		local_data_tmp[size_to_read - extra_char]=0;
-		size_t local_data_tmp_sz = strlen(local_data_tmp);
+		size_t local_data_tmp_sz = size_read;
 
 		//If it s the last line of file, we place a last '\n' for the function tokenizer
 		if(rank == num_proc-1 && ((poffset+size_to_read) == goff[num_proc])){
@@ -455,8 +433,6 @@ int main (int argc, char *argv[]){
 
 	int s = 0;
 	for (s = 1; s < 3; s++){
-
-		MPI_File mpi_file_split_comm2;
 		double time_count;
 
 		size_t total_reads = 0;
@@ -582,15 +558,12 @@ int main (int argc, char *argv[]){
 			if (local_color == 0){
 
 				MPI_Comm_split( MPI_COMM_WORLD, local_color, local_key, &split_comm);
-				ierr = MPI_File_open(split_comm, file_name,  MPI_MODE_RDONLY , finfo, &mpi_file_split_comm2);
-				//we ask to liberate file pointer
-				file_pointer_to_free = 1;
+
 				//we ask to liberate the split_comm
 				split_comm_to_free = 1;
 			}
 			else{
 				MPI_Comm_split( MPI_COMM_WORLD, MPI_UNDEFINED, local_key, &split_comm);
-				mpi_file_split_comm2 = mpi_filed;
 			}
 
 			//now we change the rank in the reads structure
@@ -630,7 +603,6 @@ int main (int argc, char *argv[]){
 							split_size,
 							split_comm,
 							file_name,
-							mpi_file_split_comm2,
 							finfo,
 							compression_level,
 							local_data,
@@ -668,7 +640,6 @@ int main (int argc, char *argv[]){
 							g_size,
 							split_comm,
 							file_name,
-							mpi_file_split_comm2,
 							finfo,
 							compression_level,
 							local_data,
@@ -696,10 +667,6 @@ int main (int argc, char *argv[]){
 
 			//we put a barrier before freeing pointers
 			MPI_Barrier(MPI_COMM_WORLD);
-			//we free the file pointer
-
-			if  (file_pointer_to_free)
-				MPI_File_close(&mpi_file_split_comm2);
 
 			//we free the split_comm
 			if (split_comm_to_free)
@@ -860,7 +827,15 @@ int main (int argc, char *argv[]){
 		// with color of zero
 		if (local_color == 0){
 			MPI_Comm_split( MPI_COMM_WORLD, local_color, local_key, &split_comm);
-			ierr = MPI_File_open(split_comm, file_name,  MPI_MODE_RDONLY, finfo, &mpi_file_split_comm);
+
+			mpi_file_split_descriptor = open(file_name, O_RDONLY );
+
+			if (mpi_file_split_descriptor == -1){
+				if (rank == 0) fprintf(stderr, "%s: Failed to open file in process 0 %s\n", argv[0], argv[1]);
+				perror("open");
+				exit(2);
+			}
+
 			//we ask to liberate file pointer
 			file_pointer_to_free = 1;
 			//we ask to liberate the split_comm
@@ -868,7 +843,7 @@ int main (int argc, char *argv[]){
 		}
 		else{
 			MPI_Comm_split( MPI_COMM_WORLD, MPI_UNDEFINED, local_key, &split_comm);
-			mpi_file_split_comm = mpi_filed;
+			mpi_file_split_descriptor = mpi_file_descriptor;
 		}
 
 		//now we change the rank in the reads structure
@@ -1541,7 +1516,7 @@ int main (int argc, char *argv[]){
 					split_comm,
 					chosen_split_rank,
 					file_name,
-					mpi_file_split_comm,
+					mpi_file_split_descriptor,
 					finfo,
 					compression_level,
 					local_offset_dest_sorted_trimmed,
@@ -1590,7 +1565,7 @@ int main (int argc, char *argv[]){
 						headerSize,
 						header,
 						chrNames[i],
-						mpi_file_split_comm,
+						mpi_file_split_descriptor,
 						uniq_chr
 					);
 
@@ -1605,7 +1580,7 @@ int main (int argc, char *argv[]){
 		MPI_Barrier(MPI_COMM_WORLD);
 		//we free the file pointer
 		if  (file_pointer_to_free)
-			MPI_File_close(&mpi_file_split_comm);
+			close(mpi_file_split_descriptor);
 		//we free the split_comm
 		if (split_comm_to_free){
 			MPI_Comm_free(&split_comm);

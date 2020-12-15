@@ -31,11 +31,28 @@
 
 #include "writeUtils.h"
 
+	#include <sys/types.h>
+	#include <sys/stat.h>
+	#include <unistd.h>
+
+
 size_t g_wu_readNum;
 size_t g_wu_totalReadNum;
 size_t g_wu_master;
 MPI_Comm COMM_WORLD;
 MPI_Status status;
+
+size_t file_get_size(char * path)
+{
+	struct stat st;
+	if(stat(path, &st) != -1)
+	{
+		return st.st_size;
+	}
+
+	return 0;
+}
+
 
 void create_read_dt(int rank, int num_proc, int *ranks, int* buffs, char** data, MPI_Datatype* dt, size_t readNum)
  {

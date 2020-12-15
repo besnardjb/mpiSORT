@@ -483,6 +483,102 @@ void bruck_size(int rank, int num_proc, size_t local_readNum, size_t* number_of_
 }
 
 
+static inline int parallel_open(MPI_Comm comm, char * path, mode_t mode)
+{
+	int out = -1;
+	int rank;
+	MPI_Comm_rank(comm, &rank);
+
+	if(!rank)
+	{
+		out = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+		MPI_Barrier(comm);
+	}
+	else
+	{
+		MPI_Barrier(comm);
+
+
+		/* On // FS there could be some delays */
+		int trials = 0;
+
+		while(trials < 3)
+		{
+			out = open(path, O_WRONLY, 0600);
+
+			if(out < 0)
+			{
+				usleep(500*rank);
+				trials++;
+			}
+		}
+	}
+
+	if(out < 0)
+	{
+		fprintf(stderr, "Rank %d failed to open %s.\nAborting.\n\n", rank, path);
+		perror("open");
+		exit(2);
+	}
+
+	return out;
+}
+
+
+
+static inline ssize_t safe_write(int fd, void *buff,  size_t size)
+{
+	size_t written = 0;
+	while( (size - written) != 0 )
+	{
+		errno = 0;
+		ssize_t ret = write(fd, buff + written, size-written);
+
+		if( ret < 0 )
+		{
+			if(errno == EINTR)
+			{
+				continue;
+			}
+
+			perror("write");
+			return ret;
+		}
+
+		written += ret;
+	}
+
+	return 0;
+}
+
+static inline ssize_t safe_write_at(int fd, void *buff,  size_t size, size_t offset)
+{
+	size_t written = 0;
+	while( (size - written) != 0 )
+	{
+		errno = 0;
+		ssize_t ret = pwrite(fd, buff + written, size-written, offset + written);
+
+		if( ret < 0 )
+		{
+			if(errno == EINTR)
+			{
+				continue;
+			}
+
+			perror("write");
+			return ret;
+		}
+
+		written += ret;
+	}
+
+	return 0;
+}	
+
+
+
+
 
 void writeSam(
 		int rank,
@@ -496,7 +592,7 @@ void writeSam(
 		MPI_Comm split_comm,
 		int master_rank,
 		char *file_name,
-		MPI_File in,
+		int in,
 		MPI_Info finfo,
 		int compression_level,
 		size_t *offset_dest_phase1,
@@ -582,7 +678,7 @@ void writeSam(
 		MPI_Datatype Datatype_Read_to_write;
 
 		//variables for MPI writes and read
-		MPI_File out;
+		int out;
 		char* path;
 		double time_count;
 		//The data in which what we read will be kept during Bruck
@@ -622,17 +718,20 @@ void writeSam(
 		 * We check offset by reading the first character
 		 * of the read in the SAM file
 		 *
+		 * 
 		for ( m = 0; m < local_readNum; m++){
 			size_t offset_to_test = pbs_offset_source_phase1[m];
 			char *buff_test = malloc(sizeof(char));
 			buff_test[1] = 0;
-			MPI_File_read_at(in, offset_to_test, buff_test, 1, MPI_CHAR, &status);
+			int ret = pread(in, buff_test, 1, offset_to_test);
+			assert(ret == 1);
 			assert( *buff_test == 'H' );
 		}
 
 		fprintf(stderr, "Rank %d :::::[WRITE][PHASE 1] check first char before bitonic 1 passed\n", rank, k);
 		MPI_Barrier(COMM_WORLD);
 		*/
+		
 
 		// we sort source offsets
 		time_count = MPI_Wtime();
@@ -683,7 +782,8 @@ void writeSam(
 				size_t offset_to_test = pbs_offset_source_phase1[m];
 				char *buff_test = malloc(sizeof(char));
 				buff_test[1] = 0;
-				MPI_File_read_at(in, offset_to_test, buff_test, 1, MPI_CHAR, &status);
+				int ret = pread(in, buff_test, 1, offset_to_test);
+				assert(ret == 1);
 				assert( *buff_test == 'H' );
 			}
 
@@ -808,7 +908,8 @@ void writeSam(
 				size_t offset_to_test = new_pbs_offset_source_phase1[m];
 				char *buff_test = malloc(sizeof(char));
 				buff_test[1] = 0;
-				MPI_File_read_at(in, offset_to_test, buff_test, 1, MPI_CHAR, &status);
+				int ret = pread(in, buff_test, 1, offset_to_test);
+				assert(ret == 1);
 				assert( *buff_test == 'H' );
 			}
 		}
@@ -1725,28 +1826,23 @@ void writeSam(
 		//MPI_Info_set(finfo,"cb_buffer_size","1610612736"); /* 128 MBytes (Optional) */
 		// END> FINE TUNING FINFO FOR WRITING OPERATIONS
 
-		ierr = MPI_File_open(MPI_COMM_SELF, path, MPI_MODE_WRONLY  + MPI_MODE_CREATE, finfo, &out);
 
-		if (ierr) {
-			fprintf(stderr, "Rank %d failed to open %s.\nAborting.\n\n", rank, path);
-			MPI_Abort(COMM_WORLD, ierr);
-			exit(2);
-		}
-		else{
+		out = parallel_open(MPI_COMM_SELF, path, 0600);
+
+		if(0 < out)
+		{
 			if(!rank)fprintf(stderr, "Rank %d :::::[WRITE][AFTER COMPRESSION] %s.gz successfully opened\n", rank, chrName);
 		}
 
 		time_count = MPI_Wtime();
 
-		if (rank == master_job_phase_2 ) {
-		
-			MPI_File_write(out, compressed_header, compressed_size_header, MPI_BYTE, MPI_STATUS_IGNORE);
+		if (rank == master_job_phase_2 )
+		{
+			ssize_t ret = safe_write(out, compressed_header, compressed_size_header);
+			assert(ret == 0);
 		}
 		free(compressed_header);
 
-	
-		//MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-                //MPI_File_write_all(out, compressed_buff, compSize, MPI_BYTE, &status);
 		time_count=MPI_Wtime();
 
 		
@@ -1755,8 +1851,8 @@ void writeSam(
 
 		if (compSize < tmp_size_buffer){
 
-			 MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-                         MPI_File_write_all(out, compressed_buff, compSize, MPI_BYTE, &status);
+			ssize_t ret = safe_write_at(out, compressed_buff, compSize, write_offset);
+			assert(ret == 0);
 		}
 		//we write by block of 1gb
 		else {
@@ -1768,11 +1864,9 @@ void writeSam(
 
 			while (tmp_size_buffer2 > 0){
 				
-		 		MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-				MPI_File_write_all(out, compressed_buff_tmp, tmp_size_buffer2, MPI_BYTE, &status);
+				ssize_t ret = safe_write_at(out, compressed_buff_tmp, tmp_size_buffer2, write_offset);
+				assert(ret == 0);
 
-				MPI_Get_count(&status, MPI_BYTE, &count_status);
-				assert(count_status == tmp_size_buffer2);
 				compressed_buff_tmp += tmp_size_buffer2;
 				tmp10 += tmp_size_buffer2;
 				write_offset += tmp_size_buffer2;
@@ -1796,7 +1890,7 @@ void writeSam(
 		//MPI_Info_set(finfo,"cb_buffer_size","2684354560"); /* 128 MBytes (Optional) */
 		
 
-		MPI_File_close(&out);	
+		close(out);	
 
 		//free(compressed_buff);
 
@@ -1817,7 +1911,7 @@ void writeSam(
 		free(fp_header);
 
 		free(compressed_buff);
-		//MPI_File_close(&out);
+
 		free(path);
 		free(y);
 		free(y2);
@@ -1834,7 +1928,6 @@ void writeSam_discordant_and_unmapped(
 		int split_size,
 		MPI_Comm split_comm,
 		char *file_name,
-		MPI_File in,
 		MPI_Info finfo,
 		int compression_level,
 		char* data,
@@ -1865,7 +1958,7 @@ void writeSam_discordant_and_unmapped(
 
 	//variables for MPI writes and read
 	//MPI_File in, out;
-	MPI_File out;
+	int out;
 	char* path;
 	double start, finish, io_time, time_count;
 
@@ -2159,9 +2252,10 @@ void writeSam_discordant_and_unmapped(
 	sprintf(path, "%s/%s.gz", output_dir, chrName);
 
 	//ierr = MPI_File_open(split_comm, path, MPI_MODE_WRONLY  + MPI_MODE_CREATE, finfo, &out);
-	ierr = MPI_File_open(MPI_COMM_SELF, path, MPI_MODE_WRONLY  + MPI_MODE_CREATE, finfo, &out);
 
-	if (ierr) {
+	out = parallel_open(MPI_COMM_SELF, path, 0600);
+
+	if (out < 0) {
 		fprintf(stderr, "Rank %d :::::[WRITE] failed to open %s.\nAborting.\n\n", split_rank, path);
 		MPI_Abort(split_comm, ierr);
 		exit(2);
@@ -2170,7 +2264,8 @@ void writeSam_discordant_and_unmapped(
 	time_count = MPI_Wtime();
 
 	if (split_rank == 0 ) {
-		MPI_File_write(out, compressed_header, compressed_size_header, MPI_BYTE, MPI_STATUS_IGNORE);
+		ssize_t ret = safe_write(out, compressed_header, compressed_size_header);
+		assert(ret == 0);
 		//we update write _header
 	}
 
@@ -2181,9 +2276,8 @@ void writeSam_discordant_and_unmapped(
 	//we write by block of 1gb
 	size_t tmp_size_buffer2 = tmp_size_buffer;
 	if ( compressed_size < tmp_size_buffer){
-	
-		MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-		MPI_File_write(out, compressed_buff, (size_t)compressed_size, MPI_BYTE, &status);
+		ssize_t ret = safe_write_at(out, compressed_buff, compressed_size, write_offset);
+		assert(ret == 0);
 	}
 	 //we write by block of 1gb
 	else {
@@ -2194,10 +2288,8 @@ void writeSam_discordant_and_unmapped(
 	 	int error_status = 0;
 	 	while (tmp_size_buffer2 > 0){
 	 		time_count=MPI_Wtime();
-	        	MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-	        	MPI_File_write_all(out, compressed_buff_tmp, tmp_size_buffer2, MPI_BYTE, &status);
-	        	MPI_Get_count(&status, MPI_BYTE, &count_status);
-	        	assert(count_status == tmp_size_buffer2);
+			 	ssize_t ret = safe_write_at(out, compressed_buff_tmp, tmp_size_buffer2, write_offset);
+				assert(ret == 0);
 	        	compressed_buff_tmp += tmp_size_buffer2;
 			tmp10 += tmp_size_buffer2;
 	        	write_offset += tmp_size_buffer2;
@@ -2227,7 +2319,7 @@ void writeSam_discordant_and_unmapped(
 
 	free(fp_header);
 	free(offset_in_data);
-	MPI_File_close(&out);
+	close(out);
 	free(compressed_buff);
 	free(char_buff_uncompressed);
 	free(read_size_sorted);
@@ -2253,7 +2345,7 @@ void writeSam_any_dim(
 		MPI_Comm split_comm,
 		int master_rank,
 		char *file_name,
-		MPI_File in,
+		int in,
 		MPI_Info finfo,
 		int compression_level,
 		size_t* new_offset_dest,
@@ -2346,7 +2438,7 @@ void writeSam_any_dim(
 	//variables for the writing part
 
 	//variables for MPI writes and read
-	MPI_File out;
+	int out;
 	char* path;
 	double time_count;
 	/*
@@ -3922,14 +4014,10 @@ void writeSam_any_dim(
 	*/
     // END> FINE TUNING FINFO FOR WRITING OPERATIONS
 
-	ierr = MPI_File_open(COMM_WORLD, path, MPI_MODE_WRONLY  + MPI_MODE_CREATE, finfo, &out);
+	out = parallel_open(MPI_COMM_SELF, path, 0600);
 
-	if (ierr) {
-		fprintf(stderr, "Rank %d :::::[WRITE_ANY_DIM] failed to open %s.\nAborting.\n\n", rank, path);
-		MPI_Abort(COMM_WORLD, ierr);
-		exit(2);
-	}
-	else{
+	if (0 < out)
+	{
 		if(!rank)fprintf(stderr, "Rank %d :::[WRITE_ANY_DIM] %s.bam successfully opened\n", rank, chrName);
 	}
 
@@ -3937,12 +4025,13 @@ void writeSam_any_dim(
 
 	if (rank == master_job_phase_2 ) {
 		fprintf(stderr, "Rank %d :::::[WRITE_ANY_DIM] we write the header \n", rank);
-		MPI_File_write(out, compressed_header, compressed_size_header, MPI_BYTE, MPI_STATUS_IGNORE);
+		ssize_t ret = safe_write(out, compressed_header, compressed_size_header);
+		assert(ret == 0);
 	}
 	free(compressed_header);
 
-	MPI_File_set_view(out, write_offset, MPI_BYTE, MPI_BYTE, "native", finfo);
-	MPI_File_write_all(out, compressed_buff, (size_t)compSize, MPI_BYTE, &status);
+	ssize_t ret = safe_write_at(out, compressed_buff, compSize, write_offset);
+	assert(ret == 0);
 
 	//task FINE TUNING FINFO BACK TO READING OPERATIONS
 	/*
@@ -3972,8 +4061,7 @@ void writeSam_any_dim(
 	}
 	free(fp_header);
 
-
-	MPI_File_close(&out);
+	close(out);
 	free(path);
 	for(m = 0; m < num_proc; m++)
 	{
